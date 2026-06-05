@@ -5074,7 +5074,7 @@ pm_interpolated_regular_expression_node_closing_set(pm_parser_t *parser, pm_inte
  * PM_NODE_FLAG_STATIC_LITERAL indicates that the node should be treated as a
  * single static literal string that can be pushed onto the stack on its own.
  * Note that this doesn't necessarily mean that the string will be frozen or
- * not; the instructions in CRuby will be either putobject or putstring,
+ * not; the instructions in CRuby will be either putobject, dupstring or dupchilledstring,
  * depending on the combination of `--enable-frozen-string-literal`,
  * `# frozen_string_literal: true`, and whether or not there is interpolation.
  *
@@ -15321,12 +15321,19 @@ parse_block_exit(pm_parser_t *parser, pm_node_t *node) {
             case PM_CONTEXT_LAMBDA_ENSURE:
             case PM_CONTEXT_LAMBDA_RESCUE:
             case PM_CONTEXT_LOOP_PREDICATE:
-            case PM_CONTEXT_POSTEXE:
             case PM_CONTEXT_UNTIL:
             case PM_CONTEXT_WHILE:
                 // These are the good cases. We're allowed to have a block exit
                 // in these contexts.
                 return;
+            case PM_CONTEXT_POSTEXE:
+                // https://bugs.ruby-lang.org/issues/20409
+                if (context_node->context == PM_CONTEXT_POSTEXE) {
+                    if (parser->version < PM_OPTIONS_VERSION_CRUBY_4_1) {
+                        return;
+                    }
+                }
+            PRISM_FALLTHROUGH
             case PM_CONTEXT_DEF:
             case PM_CONTEXT_DEF_PARAMS:
             case PM_CONTEXT_DEF_ELSE:
@@ -15479,7 +15486,7 @@ parse_conditional(pm_parser_t *parser, pm_context_t context, size_t opening_newl
     pm_token_t keyword = parser->previous;
     pm_token_t then_keyword = { 0 };
 
-    pm_node_t *predicate = parse_predicate(parser, PM_BINDING_POWER_MODIFIER, context, &then_keyword, (uint16_t) (depth + 1));
+    pm_node_t *predicate = parse_predicate(parser, PM_BINDING_POWER_COMPOSITION, context, &then_keyword, (uint16_t) (depth + 1));
     pm_statements_node_t *statements = NULL;
 
     if (!match3(parser, PM_TOKEN_KEYWORD_ELSIF, PM_TOKEN_KEYWORD_ELSE, PM_TOKEN_KEYWORD_END)) {
@@ -15517,7 +15524,7 @@ parse_conditional(pm_parser_t *parser, pm_context_t context, size_t opening_newl
             pm_token_t elsif_keyword = parser->current;
             parser_lex(parser);
 
-            pm_node_t *predicate = parse_predicate(parser, PM_BINDING_POWER_MODIFIER, PM_CONTEXT_ELSIF, &then_keyword, (uint16_t) (depth + 1));
+            pm_node_t *predicate = parse_predicate(parser, PM_BINDING_POWER_COMPOSITION, PM_CONTEXT_ELSIF, &then_keyword, (uint16_t) (depth + 1));
             pm_accepts_block_stack_push(parser, true);
 
             pm_statements_node_t *statements = parse_statements(parser, PM_CONTEXT_ELSIF, (uint16_t) (depth + 1));
@@ -19685,6 +19692,15 @@ parse_expression_prefix(pm_parser_t *parser, pm_binding_power_t binding_power, u
                         PM_PARSER_ERR_TOKEN_FORMAT(parser, &next, PM_ERR_EXPECT_EOL_AFTER_STATEMENT, pm_token_str(next.type));
                     }
                 }
+
+                // It's possible that we've parsed a block argument through our
+                // call to parse_arguments. If we found one, we should mark it
+                // as invalid and destroy it, as we don't have a place for it.
+                if (arguments.block != NULL) {
+                    pm_parser_err_node(parser, arguments.block, PM_ERR_UNEXPECTED_BLOCK_ARGUMENT);
+                    pm_node_unreference(parser, arguments.block);
+                    arguments.block = NULL;
+                }
             }
 
             switch (keyword.type) {
@@ -22261,8 +22277,8 @@ parse_program(pm_parser_t *parser) {
 
 /**
  * A vendored version of strnstr that is used to find a substring within a
- * string with a given length. This function is used to search for the Ruby
- * engine name within a shebang when the -x option is passed to Ruby.
+ * string with a given length. This function is used to search for "ruby"
+ * within a shebang when the -x option is passed to Ruby.
  *
  * The only modification that we made here is that we don't do NULL byte checks
  * because we know the little parameter will not have a NULL byte and we allow

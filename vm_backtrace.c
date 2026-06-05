@@ -751,7 +751,7 @@ rb_ec_partial_backtrace_object(const rb_execution_context_t *ec, long start_fram
                 bt_backpatch_loc(backpatch_counter, loc, CFP_ISEQ(cfp), CFP_PC(cfp));
                 RB_OBJ_WRITTEN(btobj, Qundef, CFP_ISEQ(cfp));
                 if (do_yield) {
-                    bt_yield_loc(loc - backpatch_counter, backpatch_counter, btobj);
+                    bt_yield_loc(loc - backpatch_counter + 1, backpatch_counter, btobj);
                 }
                 break;
             }
@@ -991,6 +991,7 @@ backtrace_initialize_copy(VALUE self, VALUE original)
 
     bt->backtrace_size = original_bt->backtrace_size;
     MEMCPY(bt->backtrace, original_bt->backtrace, rb_backtrace_location_t, original_bt->backtrace_size);
+    rb_gc_writebarrier_remember(self);
 
     return Qnil;
 }

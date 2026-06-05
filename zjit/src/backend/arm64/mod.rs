@@ -4,7 +4,7 @@ use crate::codegen::split_patch_point;
 use crate::cruby::*;
 use crate::backend::lir::*;
 use crate::options::asm_dump;
-use crate::stats::CompileError;
+use crate::stats::{CompileError, trace_compile_phase};
 use crate::virtualmem::CodePtr;
 use crate::cast::*;
 
@@ -409,9 +409,8 @@ impl Assembler {
             // if they were just unsigned integer.
             let is_load = matches!(insn, Insn::Load { .. } | Insn::LoadInto { .. });
             let is_jump = insn.is_jump();
-            let mut opnd_iter = insn.opnd_iter_mut();
 
-            while let Some(opnd) = opnd_iter.next() {
+            insn.for_each_operand_mut(|opnd| {
                 if let Opnd::Value(value) = opnd {
                     if value.special_const_p() {
                         *opnd = Opnd::UImm(value.as_u64());
@@ -419,7 +418,7 @@ impl Assembler {
                         *opnd = asm.load(*opnd);
                     }
                 };
-            }
+            });
 
             // We are replacing instructions here so we know they are already
             // being used. It is okay not to use their output here.
@@ -685,7 +684,7 @@ impl Assembler {
                     // Convert MemBase::Stack to MemBase::Reg(NATIVE_BASE_PTR) with the
                     // correct stack displacement. The stack slot value lives directly at
                     // [NATIVE_BASE_PTR + stack_disp], so we just adjust the base and
-                    // combine displacements — no indirection needed. Large
+                    // combine displacements -- no indirection needed. Large
                     // displacements are handled by split_stack_membase().
                     let Mem { base, disp: stack_disp, .. } = stack_state.stack_membase_to_mem(stack_membase);
                     Opnd::Mem(Mem { base, disp: stack_disp + opnd_disp, num_bits: opnd_num_bits })
@@ -1099,9 +1098,6 @@ impl Assembler {
         // The write_pos for the last Insn::PatchPoint, if any
         let mut last_patch_pos: Option<usize> = None;
 
-        // Install a panic hook to dump Assembler with insn_idx on dev builds
-        let (_hook, mut hook_insn_idx) = AssemblerPanicHook::new(self, 0);
-
         // For each instruction
         // NOTE: At this point, the assembler should have been linearized into a single giant block
         // by either resolve_parallel_mov_pass() or arm64_scratch_split().
@@ -1110,9 +1106,6 @@ impl Assembler {
         let insns = &self.basic_blocks[0].insns;
 
         while let Some(insn) = insns.get(insn_idx) {
-            // Update insn_idx that is shown on panic
-            hook_insn_idx.as_mut().map(|idx| idx.lock().map(|mut idx| *idx = insn_idx).unwrap());
-
             match insn {
                 Insn::Comment(text) => {
                     cb.add_comment(text);
@@ -1413,8 +1406,10 @@ impl Assembler {
                     emit_push(cb, opnd.into());
                 },
                 Insn::CPushPair(opnd0, opnd1) => {
+                    let first_push = if let Opnd::UImm(0) | Opnd::Imm(0) = opnd0 { X31 } else { opnd0.into() };
+                    let second_push = if let Opnd::UImm(0) | Opnd::Imm(0) = opnd1 { X31 } else { opnd1.into() };
                     // Second operand ends up at the lower stack address
-                    stp_pre(cb, opnd1.into(), opnd0.into(), A64Opnd::new_mem(64, C_SP_REG, -C_SP_STEP));
+                    stp_pre(cb, second_push, first_push, A64Opnd::new_mem(64, C_SP_REG, -C_SP_STEP));
                 },
                 Insn::CPop { out } => {
                     emit_pop(cb, out.into());
@@ -1423,8 +1418,15 @@ impl Assembler {
                     emit_pop(cb, opnd.into());
                 },
                 Insn::CPopPairInto(opnd0, opnd1) => {
+                    let mut first_pop = opnd0.into();
+                    let second_pop = opnd1.into();
+                    // Avoid illegal load pair into the same register
+                    // by sinking the first pop to the zero register.
+                    if first_pop == second_pop {
+                        first_pop = X31;
+                    }
                     // First operand is popped from the lower stack address
-                    ldp_post(cb, opnd0.into(), opnd1.into(), A64Opnd::new_mem(64, C_SP_REG, C_SP_STEP));
+                    ldp_post(cb, first_pop, second_pop, A64Opnd::new_mem(64, C_SP_REG, C_SP_STEP));
                 },
                 Insn::CCall { fptr, .. } => {
                     match fptr {
@@ -1561,6 +1563,9 @@ impl Assembler {
                 Insn::Breakpoint => {
                     brk(cb, A64Opnd::None);
                 },
+                Insn::Abort => {
+                    udf(cb, u16::MAX);
+                },
                 Insn::CSelZ { truthy, falsy, out } |
                 Insn::CSelE { truthy, falsy, out } => {
                     csel(cb, out.into(), truthy.into(), falsy.into(), Condition::EQ);
@@ -1581,7 +1586,6 @@ impl Assembler {
                 Insn::CSelGE { truthy, falsy, out } => {
                     csel(cb, out.into(), truthy.into(), falsy.into(), Condition::GE);
                 }
-                Insn::LiveReg { .. } => (), // just a reg alloc signal, no code
             };
 
             insn_idx += 1;
@@ -1610,63 +1614,71 @@ impl Assembler {
         let use_scratch_reg = !self.accept_scratch_reg;
         asm_dump!(self, init);
 
-        let mut asm = self.arm64_split();
+        let mut asm = trace_compile_phase("split", || self.arm64_split());
 
         asm_dump!(asm, split);
 
-        asm.number_instructions(0);
+        trace_compile_phase("regalloc", || {
+            trace_compile_phase("number_instructions", || asm.number_instructions(0));
 
-        let live_in = asm.analyze_liveness();
-        let intervals = asm.build_intervals(live_in);
+            let live_in = trace_compile_phase("analyze_liveness", || asm.analyze_liveness());
+            let intervals = trace_compile_phase("build_intervals", || asm.build_intervals(live_in));
 
-        // Dump live intervals if requested
-        if let Some(crate::options::Options { dump_lir: Some(dump_lirs), .. }) = unsafe { crate::options::OPTIONS.as_ref() } {
-            if dump_lirs.contains(&crate::options::DumpLIR::live_intervals) {
-                println!("LIR live_intervals:\n{}", crate::backend::lir::debug_intervals(&asm, &intervals));
+            // Dump live intervals if requested
+            if let Some(crate::options::Options { dump_lir: Some(dump_lirs), .. }) = unsafe { crate::options::OPTIONS.as_ref() } {
+                if dump_lirs.contains(&crate::options::DumpLIR::live_intervals) {
+                    println!("LIR live_intervals:\n{}", crate::backend::lir::debug_intervals(&asm, &intervals));
+                }
             }
-        }
 
-        let preferred_registers = asm.preferred_register_assignments(&intervals);
-        let (assignments, num_stack_slots) = asm.linear_scan(intervals.clone(), regs.len(), &preferred_registers);
+            let preferred_registers = trace_compile_phase("preferred_registers", || asm.preferred_register_assignments(&intervals));
+            let (assignments, num_stack_slots) = trace_compile_phase("linear_scan", || asm.linear_scan(intervals.clone(), regs.len(), &preferred_registers));
 
-        let total_stack_slots = asm.stack_base_idx + num_stack_slots;
-        if total_stack_slots > Self::MAX_FRAME_STACK_SLOTS {
-            return Err(CompileError::NativeStackTooLarge);
-        }
+            let total_stack_slots = asm.stack_base_idx + num_stack_slots;
+            if total_stack_slots > Self::MAX_FRAME_STACK_SLOTS {
+                return Err(CompileError::NativeStackTooLarge);
+            }
 
-        // Dump vreg-to-physical-register mapping if requested
-        if let Some(crate::options::Options { dump_lir: Some(dump_lirs), .. }) = unsafe { crate::options::OPTIONS.as_ref() } {
-            if dump_lirs.contains(&crate::options::DumpLIR::alloc_regs) {
-                println!("LIR live_intervals:\n{}", crate::backend::lir::debug_intervals(&asm, &intervals));
+            // Dump vreg-to-physical-register mapping if requested
+            if let Some(crate::options::Options { dump_lir: Some(dump_lirs), .. }) = unsafe { crate::options::OPTIONS.as_ref() } {
+                if dump_lirs.contains(&crate::options::DumpLIR::alloc_regs) {
+                    println!("LIR live_intervals:\n{}", crate::backend::lir::debug_intervals(&asm, &intervals));
 
-                println!("VReg assignments:");
-                for (i, alloc) in assignments.iter().enumerate() {
-                    if let Some(alloc) = alloc {
-                        let range = &intervals[i].range;
-                        let alloc_str = match alloc {
-                            Allocation::Reg(n) => format!("{}", regs[*n]),
-                            Allocation::Fixed(reg) => format!("{}", reg),
-                            Allocation::Stack(n) => format!("Stack[{}]", n),
-                        };
-                        println!("  v{} => {} (range: {:?}..{:?})", i, alloc_str, range.start, range.end);
+                    println!("VReg assignments:");
+                    for (i, alloc) in assignments.iter().enumerate() {
+                        if let Some(alloc) = alloc {
+                            let range = &intervals[i].range;
+                            let alloc_str = match alloc {
+                                Allocation::Reg(n) => format!("{}", regs[*n]),
+                                Allocation::Fixed(reg) => format!("{}", reg),
+                                Allocation::Stack(n) => format!("Stack[{}]", n),
+                            };
+                            println!("  v{} => {} (range: {:?}..{:?})", i, alloc_str, range.start, range.end);
+                        }
                     }
                 }
             }
-        }
 
-        // Update FrameSetup slot_count to account for:
-        // 1) stack slots reserved for block params (stack_base_idx), and
-        // 2) register allocator spills (num_stack_slots).
-        for block in asm.basic_blocks.iter_mut() {
-            for insn in block.insns.iter_mut() {
-                if let Insn::FrameSetup { slot_count, .. } = insn {
-                    *slot_count = total_stack_slots;
+            // Update FrameSetup slot_count to account for:
+            // 1) stack slots reserved for block params (stack_base_idx), and
+            // 2) register allocator spills (num_stack_slots).
+            trace_compile_phase("count_stack_slots", || {
+                for block in asm.basic_blocks.iter_mut() {
+                    for insn in block.insns.iter_mut() {
+                        if let Insn::FrameSetup { slot_count, .. } = insn {
+                            *slot_count = total_stack_slots;
+                        }
+                    }
                 }
-            }
-        }
+            });
 
-        asm.handle_caller_saved_regs(&intervals, &assignments, &C_ARG_REGREGS);
-        asm.resolve_ssa(&intervals, &assignments);
+            trace_compile_phase("resolve_ssa", || {
+                asm.handle_caller_saved_regs(&intervals, &assignments, &C_ARG_REGREGS);
+                asm.resolve_ssa(&intervals, &assignments);
+            });
+
+            Ok(())
+        })?;
         asm_dump!(asm, alloc_regs);
 
         // We are moved out of SSA after resolve_ssa
@@ -1674,43 +1686,47 @@ impl Assembler {
         // We put compile_exits after alloc_regs to avoid extending live ranges for VRegs spilled on side exits.
         // Exit code is compiled into a separate list of instructions that we append
         // to the last reachable block before scratch_split, so it gets linearized and split.
-        let exit_insns = asm.compile_exits();
+        trace_compile_phase("compile_exits", || {
+            let exit_insns = asm.compile_exits();
+
+            // Append exit instructions to the last reachable block so they are
+            // included in linearize_instructions and processed by scratch_split.
+            if let Some(&last_block) = asm.block_order().last() {
+                for insn in exit_insns {
+                    asm.basic_blocks[last_block.0].insns.push(insn);
+                    asm.basic_blocks[last_block.0].insn_ids.push(None);
+                }
+            }
+        });
         asm_dump!(asm, compile_exits);
 
-        // Append exit instructions to the last reachable block so they are
-        // included in linearize_instructions and processed by scratch_split.
-        if let Some(&last_block) = asm.block_order().last() {
-            for insn in exit_insns {
-                asm.basic_blocks[last_block.0].insns.push(insn);
-                asm.basic_blocks[last_block.0].insn_ids.push(None);
-            }
-        }
-
         if use_scratch_reg {
-            asm = asm.arm64_scratch_split();
+            asm = trace_compile_phase("scratch_split", || asm.arm64_scratch_split());
             asm_dump!(asm, scratch_split);
         } else {
             // For trampolines that use scratch registers, resolve ParallelMov without scratch_reg.
-            asm = asm.resolve_parallel_mov_pass();
+            asm = trace_compile_phase("resolve_parallel_mov", || asm.resolve_parallel_mov_pass());
             asm_dump!(asm, resolve_parallel_mov);
         }
 
-        // Create label instances in the code block
-        for (idx, name) in asm.label_names.iter().enumerate() {
-            let label = cb.new_label(name.to_string());
-            assert_eq!(label, Label(idx));
-        }
+        trace_compile_phase("emit", || {
+            // Create label instances in the code block
+            for (idx, name) in asm.label_names.iter().enumerate() {
+                let label = cb.new_label(name.to_string());
+                assert_eq!(label, Label(idx));
+            }
 
-        let start_ptr = cb.get_write_ptr();
-        let gc_offsets = asm.arm64_emit(cb).inspect_err(|_| cb.clear_labels())?;
-        assert!(!cb.has_dropped_bytes(), "emit should not drop bytes without error");
+            let start_ptr = cb.get_write_ptr();
+            let gc_offsets = asm.arm64_emit(cb).inspect_err(|_| cb.clear_labels())?;
+            assert!(!cb.has_dropped_bytes(), "emit should not drop bytes without error");
 
-        cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
+            cb.link_labels().or(Err(CompileError::LabelLinkingFailure))?;
 
-        // Invalidate icache for newly written out region so we don't run stale code.
-        unsafe { rb_jit_icache_invalidate(start_ptr.raw_ptr(cb) as _, cb.get_write_ptr().raw_ptr(cb) as _) };
+            // Invalidate icache for newly written out region so we don't run stale code.
+            unsafe { rb_jit_icache_invalidate(start_ptr.raw_ptr(cb) as _, cb.get_write_ptr().raw_ptr(cb) as _) };
 
-        Ok((start_ptr, gc_offsets))
+            Ok((start_ptr, gc_offsets))
+        })
     }
 }
 
@@ -2783,17 +2799,17 @@ mod tests {
         0x10: mov x4, #5
         0x14: stp x1, x0, [sp, #-0x10]!
         0x18: stp x3, x2, [sp, #-0x10]!
-        0x1c: str x4, [sp, #-0x10]!
+        0x1c: stp xzr, x4, [sp, #-0x10]!
         0x20: mov x16, #0
         0x24: blr x16
-        0x28: ldr x4, [sp], #0x10
+        0x28: ldp xzr, x4, [sp], #0x10
         0x2c: ldp x3, x2, [sp], #0x10
         0x30: ldp x1, x0, [sp], #0x10
         0x34: adds x0, x0, x1
         0x38: adds x0, x2, x3
         0x3c: adds x0, x2, x4
         ");
-        assert_snapshot!(cb.hexdump(), @"200080d2410080d2620080d2830080d2a40080d2e103bfa9e30bbfa9e40f1ff8100080d200023fd6e40741f8e30bc1a8e103c1a8000001ab400003ab400004ab");
+        assert_snapshot!(cb.hexdump(), @"200080d2410080d2620080d2830080d2a40080d2e103bfa9e30bbfa9ff13bfa9100080d200023fd6ff13c1a8e30bc1a8e103c1a8000001ab400003ab400004ab");
     }
 
     #[test]

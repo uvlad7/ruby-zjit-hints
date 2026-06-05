@@ -34,11 +34,14 @@ enum jit_bindgen_constants {
     // Field offset for prime classext's fields_obj from a class pointer
     RCLASS_OFFSET_PRIME_FIELDS_OBJ = offsetof(struct RClass_and_rb_classext_t, classext.fields_obj),
 
-    // Field offset for fields_obj in RTypedData
-    RTYPEDDATA_OFFSET_FIELDS_OBJ = offsetof(struct RTypedData, fields_obj),
+    // Field offset for fields_obj in T_DATA
+    TDATA_OFFSET_FIELDS_OBJ = offsetof(struct RTypedData, fields_obj),
 
     // Field offsets for the RString struct
     RUBY_OFFSET_RSTRING_LEN = offsetof(struct RString, len),
+
+    // Shape constant related to RBasic::flags. (See RBASIC_SET_SHAPE_ID())
+    RB_SHAPE_FLAG_SHIFT = SHAPE_FLAG_SHIFT,
 
     // Field offsets for rb_execution_context_t
     RUBY_OFFSET_EC_CFP = offsetof(rb_execution_context_t, cfp),
@@ -546,9 +549,9 @@ rb_set_cfp_sp(struct rb_control_frame_struct *cfp, VALUE *sp)
 }
 
 bool
-rb_jit_shape_too_complex_p(shape_id_t shape_id)
+rb_jit_shape_complex_p(shape_id_t shape_id)
 {
-    return rb_shape_too_complex_p(shape_id);
+    return rb_shape_complex_p(shape_id);
 }
 
 bool
@@ -565,7 +568,7 @@ rb_jit_class_fields_embedded_p(VALUE klass)
 }
 
 bool
-rb_jit_typed_data_fields_embedded_p(VALUE obj)
+rb_jit_data_fields_embedded_p(VALUE obj)
 {
     VALUE fields_obj = RTYPEDDATA(obj)->fields_obj;
     return !fields_obj || !FL_TEST_RAW(fields_obj, OBJ_FIELD_HEAP);

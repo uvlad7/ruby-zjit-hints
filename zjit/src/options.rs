@@ -97,6 +97,12 @@ pub struct Options {
     /// Frequency of tracing side exits.
     pub trace_side_exits_sample_interval: usize,
 
+    /// Trace compilation phases as Perfetto duration events.
+    pub trace_compiles: bool,
+
+    /// Trace invalidation events as Perfetto duration events.
+    pub trace_invalidation: bool,
+
     /// Dump code map to /tmp for performance profilers.
     pub perf: Option<PerfMap>,
 
@@ -130,6 +136,8 @@ impl Default for Options {
             dump_disasm: None,
             trace_side_exits: None,
             trace_side_exits_sample_interval: 0,
+            trace_compiles: false,
+            trace_invalidation: false,
             perf: None,
             allowed_iseqs: None,
             log_compiled_iseqs: None,
@@ -161,7 +169,11 @@ pub const ZJIT_OPTIONS: &[(&str, &str)] = &[
     ("--zjit-trace-exits[=counter]",
                      "Record source on side-exit. `Counter` picks specific counter."),
     ("--zjit-trace-exits-sample-rate=num",
-                     "Frequency at which to record side exits. Must be `usize`.")
+                     "Frequency at which to record side exits. Must be `usize`."),
+    ("--zjit-trace-compiles",
+                     "Record compilation phases as Perfetto trace events."),
+    ("--zjit-trace-invalidation",
+                     "Record invalidation events as Perfetto trace events."),
 ];
 
 #[derive(Copy, Clone, Debug)]
@@ -388,6 +400,10 @@ fn parse_option(str_ptr: *const std::os::raw::c_char) -> Option<()> {
             options.trace_side_exits_sample_interval = sample_interval.parse::<usize>().ok()?;
         }
 
+        ("trace-compiles", "") => options.trace_compiles = true,
+
+        ("trace-invalidation", "") => options.trace_invalidation = true,
+
         ("debug", "") => options.debug = true,
 
         ("disable", "") => options.disable = true,
@@ -521,7 +537,7 @@ pub fn enable_zjit_stats() {
     unsafe { OPTIONS.as_mut() }.unwrap().stats = true;
 }
 
-/// Print YJIT options for `ruby --help`. `width` is width of option parts, and
+/// Print ZJIT options for `ruby --help`. `width` is width of option parts, and
 /// `columns` is indent width of descriptions.
 #[unsafe(no_mangle)]
 pub extern "C" fn rb_zjit_show_usage(help: c_int, highlight: c_int, width: c_uint, columns: c_int) {

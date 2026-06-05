@@ -258,7 +258,7 @@ pub struct rb_iseq_constant_body {
 /// that this is a handle. Sometimes the C code briefly uses VALUE as
 /// an unsigned integer type and don't necessarily store valid handles but
 /// thankfully those cases are rare and don't cross the FFI boundary.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 #[repr(transparent)] // same size and alignment as simply `usize`
 pub struct VALUE(pub usize);
 
@@ -271,6 +271,9 @@ pub struct ID(pub ::std::os::raw::c_ulong);
 /// Pointer to an ISEQ
 pub type IseqPtr = *const rb_iseq_t;
 
+/// Index of a YARV instruction within an ISEQ's bytecode array.
+pub type YarvInsnIdx = usize;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ShapeId(pub u32);
 
@@ -281,8 +284,8 @@ impl ShapeId {
         self != INVALID_SHAPE_ID
     }
 
-    pub fn is_too_complex(self) -> bool {
-        unsafe { rb_jit_shape_too_complex_p(self.0) }
+    pub fn is_complex(self) -> bool {
+        unsafe { rb_jit_shape_complex_p(self.0) }
     }
 
     pub fn is_frozen(self) -> bool {
@@ -330,11 +333,12 @@ pub fn iseq_rest_param_idx(params: &IseqParameters) -> Option<i32> {
 pub fn for_each_iseq<F: FnMut(IseqPtr)>(mut callback: F) {
     unsafe extern "C" fn callback_wrapper(iseq: IseqPtr, data: *mut c_void) {
         // SAFETY: points to the local below
-        let callback: &mut &mut dyn FnMut(IseqPtr) -> bool = unsafe { std::mem::transmute(&mut *data) };
-        callback(iseq);
+        let callback: *mut *mut dyn FnMut(IseqPtr) -> bool = data.cast();
+        unsafe { (**callback)(iseq) };
     }
-    let mut data: &mut dyn FnMut(IseqPtr) = &mut callback;
-    unsafe { rb_jit_for_each_iseq(Some(callback_wrapper), (&mut data) as *mut _ as *mut c_void) };
+    let mut data: *mut dyn FnMut(IseqPtr) = &raw mut callback;
+    let data: *mut *mut dyn FnMut(IseqPtr) = &raw mut data;
+    unsafe { rb_jit_for_each_iseq(Some(callback_wrapper), data.cast()) };
 }
 
 /// Return a poison value to be set above the stack top to verify leafness.
@@ -614,15 +618,13 @@ impl VALUE {
         unsafe { rb_jit_class_fields_embedded_p(self) }
     }
 
-    /// Typed `T_DATA` made from `TypedData_Make_Struct()` (e.g. Thread, ARGF)
-    pub fn typed_data_p(self) -> bool {
+    pub fn data_p(self) -> bool {
         !self.special_const_p() &&
-            self.builtin_type() == RUBY_T_DATA &&
-            0 != (self.builtin_flags() & RUBY_TYPED_FL_IS_TYPED_DATA.to_usize())
+            self.builtin_type() == RUBY_T_DATA
     }
 
-    pub fn typed_data_fields_embedded_p(self) -> bool {
-        unsafe { rb_jit_typed_data_fields_embedded_p(self) }
+    pub fn data_fields_embedded_p(self) -> bool {
+        unsafe { rb_jit_data_fields_embedded_p(self) }
     }
 
     pub fn as_fixnum(self) -> i64 {
@@ -763,6 +765,17 @@ impl IseqParameters {
         } else {
             // The ISeq entry point is index 0 when there are no optional parameters
             &[VALUE(0)]
+        }
+    }
+}
+
+impl Debug for VALUE {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        // Only use rb_obj_info() when {:#?} since it dereferences the pointer so carries some risk.
+        if f.alternate() {
+            write!(f, "VALUE({})", self.obj_info())
+        } else {
+            write!(f, "VALUE(0x{:x})", self.0)
         }
     }
 }
@@ -1227,24 +1240,24 @@ pub mod test_utils {
     pub fn with_rubyvm<T>(mut func: impl FnMut() -> T) -> T {
         RUBY_VM_INIT.call_once(boot_rubyvm);
 
-        // Set up a callback wrapper to store a return value
-        let mut result: Option<T> = None;
-        let mut data: &mut dyn FnMut() = &mut || {
-            // Store the result externally
-            result.replace(func());
-        };
-
         // Invoke callback through rb_protect() so exceptions don't crash the process.
         // "Fun" double pointer dance to get a thin function pointer to pass through C
         unsafe extern "C" fn callback_wrapper(data: VALUE) -> VALUE {
             // SAFETY: shorter lifetime than the data local in the caller frame
-            let callback: *mut &mut dyn FnMut() = std::ptr::with_exposed_provenance_mut(data.0);
-            unsafe { (*callback)() };
+            let callback: *const *mut dyn FnMut() = std::ptr::with_exposed_provenance_mut(data.0);
+            unsafe { (**callback)() };
             Qnil
         }
 
+        // Set up a callback wrapper to store the return value
+        let mut result: Option<T> = None;
+        let mut func_wrapper = || {
+            result.replace(func());
+        };
+        let data: *mut dyn FnMut() = &raw mut func_wrapper;
+        let data: *const *mut dyn FnMut() = &raw const data;
         let mut state: c_int = 0;
-        unsafe { super::rb_protect(Some(callback_wrapper), VALUE((&raw mut data).expose_provenance()), &mut state) };
+        unsafe { super::rb_protect(Some(callback_wrapper), VALUE(data.expose_provenance()), &mut state) };
         if state != 0 {
             unsafe { rb_zjit_print_exception(); }
             assert_eq!(0, state, "Exceptional unwind in callback. Ruby exception?");
@@ -1290,11 +1303,23 @@ pub mod test_utils {
     }
 
     /// Like inspect, but also asserts that all compilations triggered by this program succeed.
-    pub fn assert_compiles(program: &str) -> String {
+    pub fn assert_compiles_allowing_exits(program: &str) -> String {
         use crate::state::ZJITState;
         ZJITState::enable_assert_compiles();
         let result = inspect(program);
         ZJITState::disable_assert_compiles();
+        result
+    }
+
+    /// Like inspect, but also asserts that all compilations triggered by this program succeed and
+    /// no side exits occurr during the program.
+    pub fn assert_compiles(program: &str) -> String {
+        use crate::state::ZJITState;
+        let exits_before = crate::stats::total_exit_count();
+        ZJITState::enable_assert_compiles();
+        let result = inspect(program);
+        ZJITState::disable_assert_compiles();
+        assert_eq!(exits_before, crate::stats::total_exit_count(), "Program side-exited");
         result
     }
 
@@ -1416,6 +1441,13 @@ pub mod test_utils {
     fn value_from_fixnum_too_small_isize() {
         assert_eq!(VALUE::fixnum_from_isize(RUBY_FIXNUM_MIN-1), VALUE(1));
     }
+
+    #[test]
+    fn value_fmt_debug() {
+        assert_eq!("VALUE(0xcafe)", format!("{:?}", VALUE(0xcafe)));
+        let alternate = format!("{:#?}", eval("::Hash"));
+        assert!(alternate.contains("Hash"), "'Hash' not substring of '{alternate}'");
+    }
 }
 #[cfg(test)]
 pub use test_utils::*;
@@ -1445,6 +1477,19 @@ pub fn get_class_name(class: VALUE) -> String {
     }
 
     name
+}
+
+// Return the module name for a given module or class. For anonymous modules, returns None since
+// rb_mod_name returns Qnil.
+pub fn get_module_name(module: VALUE) -> Option<String> {
+    // type checks for rb_mod_name()
+    assert!(unsafe { RB_TYPE_P(module, RUBY_T_MODULE) || RB_TYPE_P(module, RUBY_T_CLASS) }, "Expected class or module");
+    let name = unsafe { rb_mod_name(module) };
+    if name == Qnil {
+        None
+    } else {
+        Some(ruby_str_to_rust_string(name))
+    }
 }
 
 
@@ -1494,6 +1539,12 @@ mod class_name_tests {
 }
 
 pub fn class_has_leaf_allocator(class: VALUE) -> bool {
+    // We need to check if the class is initialized and not a singleton before
+    // trying to read the allocator, otherwise it will raise.
+    // Because of this they should be considered non-leaf anyways.
+    if !unsafe { rb_zjit_class_initialized_p(class) } { return false; }
+    if unsafe { rb_zjit_singleton_class_p(class) } { return false; }
+
     // empty_hash_alloc
     if class == unsafe { rb_cHash } { return true; }
     // empty_ary_alloc
@@ -1504,6 +1555,38 @@ pub fn class_has_leaf_allocator(class: VALUE) -> bool {
     if class == unsafe { rb_cRegexp } { return true; }
     // rb_class_allocate_instance
     unsafe { rb_zjit_class_has_default_allocator(class) }
+}
+
+/// Whether a method ISEQ defined on `owner` is guaranteed to run with a `self`
+/// that is a heap (non-immediate) object.
+///
+/// True only for plain `def` methods (`ISEQ_TYPE_METHOD`) defined on a normal,
+/// initialized, non-singleton class that uses the default allocator
+/// (`rb_class_allocate_instance`). The receiver of such a method is always
+/// `kind_of?` the owner, and no user class with the default allocator can be
+/// inserted into the ancestry of an immediate, so `self` cannot be an immediate.
+///
+/// The default-allocator check alone is not sufficient: `Object`, `BasicObject`,
+/// and `Numeric` use the default allocator yet are ancestors of immediates (e.g.
+/// `Integer`). Every such class is also an ancestor of `Integer`, so a single
+/// `rb_obj_is_kind_of(<a fixnum>, owner)` check rules all of them out.
+///
+/// Returns `false` conservatively for anything that doesn't clearly qualify
+/// (modules, singleton classes, custom allocators, non-`def` ISEQs, etc.).
+pub fn iseq_self_is_heap_object(iseq: IseqPtr, owner: VALUE) -> bool {
+    if unsafe { rb_get_iseq_body_type(iseq) } != ISEQ_TYPE_METHOD { return false; }
+    if !unsafe { RB_TYPE_P(owner, RUBY_T_CLASS) } { return false; }
+    // Check initialized + non-singleton before reading the allocator (reading it otherwise
+    // aborts).
+    // TODO(max): Determine if we can loosen this to allow methods defined on singleton classes.
+    if !unsafe { rb_zjit_class_initialized_p(owner) } { return false; }
+    if unsafe { rb_zjit_singleton_class_p(owner) } { return false; }
+    if !unsafe { rb_zjit_class_has_default_allocator(owner) } { return false; }
+    // Exclude Object/BasicObject/Numeric and friends: classes that use the default
+    // allocator but sit above an immediate class in the ancestry chain. They are
+    // all ancestors of Integer, so this single check covers every immediate type.
+    if unsafe { rb_obj_is_kind_of(VALUE::fixnum_from_usize(0), owner) }.test() { return false; }
+    true
 }
 
 /// Interned ID values for Ruby symbols and method names.
@@ -1563,21 +1646,9 @@ pub(crate) mod ids {
         name: freeze
         name: minusat            content: b"-@"
         name: aref               content: b"[]"
-        name: len
-        name: _as_heap
-        name: _fields_obj
-        name: thread_ptr
-        name: self_              content: b"self"
         name: rb_ivar_get_at_no_ractor_check
-        name: _shape_id
-        name: _env_data_index_flags
-        name: _env_data_index_specval
-        name: _ep_method_entry
-        name: _ep_specval
-        name: _rbasic_flags
         name: RUBY_FL_FREEZE
         name: RUBY_ELTS_SHARED
-        name: VM_FRAME_FLAG_MODIFIED_BLOCK_PARAM
         name: RubyVM
         name: ZJIT
         name: induce_side_exit_bang       content: b"induce_side_exit!"

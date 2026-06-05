@@ -2334,6 +2334,10 @@ io_buffer_each_byte(int argc, VALUE *argv, VALUE self)
     size_t offset, count;
     io_buffer_extract_offset_count(RB_IO_BUFFER_DATA_TYPE_U8, size, argc, argv, &offset, &count);
 
+    if (size_sum_is_bigger_than(offset, count, size)) {
+        rb_raise(rb_eArgError, "Specified offset+count is bigger than the buffer size!");
+    }
+
     for (size_t i = 0; i < count; i++) {
         unsigned char *value = (unsigned char *)base + i + offset;
         rb_yield(RB_INT2FIX(*value));
@@ -3374,14 +3378,14 @@ io_buffer_pwrite(int argc, VALUE *argv, VALUE self)
 }
 
 static inline void
-io_buffer_check_mask(const struct rb_io_buffer *buffer)
+io_buffer_check_mask_size(size_t size)
 {
-    if (buffer->size == 0)
+    if (size == 0)
         rb_raise(rb_eIOBufferMaskError, "Zero-length mask given!");
 }
 
 static void
-memory_and(unsigned char * restrict output, unsigned char * restrict base, size_t size, unsigned char * restrict mask, size_t mask_size)
+memory_and(unsigned char * restrict output, const unsigned char * restrict base, size_t size, const unsigned char * restrict mask, size_t mask_size)
 {
     for (size_t offset = 0; offset < size; offset += 1) {
         output[offset] = base[offset] & mask[offset % mask_size];
@@ -3409,19 +3413,27 @@ io_buffer_and(VALUE self, VALUE mask)
     struct rb_io_buffer *mask_buffer = NULL;
     TypedData_Get_Struct(mask, struct rb_io_buffer, &rb_io_buffer_type, mask_buffer);
 
-    io_buffer_check_mask(mask_buffer);
+    const void *base;
+    size_t size;
+    io_buffer_get_bytes_for_reading(buffer, &base, &size);
 
-    VALUE output = rb_io_buffer_new(NULL, buffer->size, io_flags_for_size(buffer->size));
+    const void *mask_base;
+    size_t mask_size;
+    io_buffer_get_bytes_for_reading(mask_buffer, &mask_base, &mask_size);
+
+    io_buffer_check_mask_size(mask_size);
+
+    VALUE output = rb_io_buffer_new(NULL, size, io_flags_for_size(size));
     struct rb_io_buffer *output_buffer = NULL;
     TypedData_Get_Struct(output, struct rb_io_buffer, &rb_io_buffer_type, output_buffer);
 
-    memory_and(output_buffer->base, buffer->base, buffer->size, mask_buffer->base, mask_buffer->size);
+    memory_and(output_buffer->base, base, size, mask_base, mask_size);
 
     return output;
 }
 
 static void
-memory_or(unsigned char * restrict output, unsigned char * restrict base, size_t size, unsigned char * restrict mask, size_t mask_size)
+memory_or(unsigned char * restrict output, const unsigned char * restrict base, size_t size, const unsigned char * restrict mask, size_t mask_size)
 {
     for (size_t offset = 0; offset < size; offset += 1) {
         output[offset] = base[offset] | mask[offset % mask_size];
@@ -3449,19 +3461,27 @@ io_buffer_or(VALUE self, VALUE mask)
     struct rb_io_buffer *mask_buffer = NULL;
     TypedData_Get_Struct(mask, struct rb_io_buffer, &rb_io_buffer_type, mask_buffer);
 
-    io_buffer_check_mask(mask_buffer);
+    const void *base;
+    size_t size;
+    io_buffer_get_bytes_for_reading(buffer, &base, &size);
 
-    VALUE output = rb_io_buffer_new(NULL, buffer->size, io_flags_for_size(buffer->size));
+    const void *mask_base;
+    size_t mask_size;
+    io_buffer_get_bytes_for_reading(mask_buffer, &mask_base, &mask_size);
+
+    io_buffer_check_mask_size(mask_size);
+
+    VALUE output = rb_io_buffer_new(NULL, size, io_flags_for_size(size));
     struct rb_io_buffer *output_buffer = NULL;
     TypedData_Get_Struct(output, struct rb_io_buffer, &rb_io_buffer_type, output_buffer);
 
-    memory_or(output_buffer->base, buffer->base, buffer->size, mask_buffer->base, mask_buffer->size);
+    memory_or(output_buffer->base, base, size, mask_base, mask_size);
 
     return output;
 }
 
 static void
-memory_xor(unsigned char * restrict output, unsigned char * restrict base, size_t size, unsigned char * restrict mask, size_t mask_size)
+memory_xor(unsigned char * restrict output, const unsigned char * restrict base, size_t size, const unsigned char * restrict mask, size_t mask_size)
 {
     for (size_t offset = 0; offset < size; offset += 1) {
         output[offset] = base[offset] ^ mask[offset % mask_size];
@@ -3489,19 +3509,27 @@ io_buffer_xor(VALUE self, VALUE mask)
     struct rb_io_buffer *mask_buffer = NULL;
     TypedData_Get_Struct(mask, struct rb_io_buffer, &rb_io_buffer_type, mask_buffer);
 
-    io_buffer_check_mask(mask_buffer);
+    const void *base;
+    size_t size;
+    io_buffer_get_bytes_for_reading(buffer, &base, &size);
 
-    VALUE output = rb_io_buffer_new(NULL, buffer->size, io_flags_for_size(buffer->size));
+    const void *mask_base;
+    size_t mask_size;
+    io_buffer_get_bytes_for_reading(mask_buffer, &mask_base, &mask_size);
+
+    io_buffer_check_mask_size(mask_size);
+
+    VALUE output = rb_io_buffer_new(NULL, size, io_flags_for_size(size));
     struct rb_io_buffer *output_buffer = NULL;
     TypedData_Get_Struct(output, struct rb_io_buffer, &rb_io_buffer_type, output_buffer);
 
-    memory_xor(output_buffer->base, buffer->base, buffer->size, mask_buffer->base, mask_buffer->size);
+    memory_xor(output_buffer->base, base, size, mask_base, mask_size);
 
     return output;
 }
 
 static void
-memory_not(unsigned char * restrict output, unsigned char * restrict base, size_t size)
+memory_not(unsigned char * restrict output, const unsigned char * restrict base, size_t size)
 {
     for (size_t offset = 0; offset < size; offset += 1) {
         output[offset] = ~base[offset];
@@ -3526,11 +3554,15 @@ io_buffer_not(VALUE self)
     struct rb_io_buffer *buffer = NULL;
     TypedData_Get_Struct(self, struct rb_io_buffer, &rb_io_buffer_type, buffer);
 
-    VALUE output = rb_io_buffer_new(NULL, buffer->size, io_flags_for_size(buffer->size));
+    const void *base;
+    size_t size;
+    io_buffer_get_bytes_for_reading(buffer, &base, &size);
+
+    VALUE output = rb_io_buffer_new(NULL, size, io_flags_for_size(size));
     struct rb_io_buffer *output_buffer = NULL;
     TypedData_Get_Struct(output, struct rb_io_buffer, &rb_io_buffer_type, output_buffer);
 
-    memory_not(output_buffer->base, buffer->base, buffer->size);
+    memory_not(output_buffer->base, base, size);
 
     return output;
 }
@@ -3586,7 +3618,7 @@ io_buffer_and_inplace(VALUE self, VALUE mask)
     struct rb_io_buffer *mask_buffer = NULL;
     TypedData_Get_Struct(mask, struct rb_io_buffer, &rb_io_buffer_type, mask_buffer);
 
-    io_buffer_check_mask(mask_buffer);
+    io_buffer_check_mask_size(mask_buffer->size);
     io_buffer_check_overlaps(buffer, mask_buffer);
 
     void *base;
@@ -3632,7 +3664,7 @@ io_buffer_or_inplace(VALUE self, VALUE mask)
     struct rb_io_buffer *mask_buffer = NULL;
     TypedData_Get_Struct(mask, struct rb_io_buffer, &rb_io_buffer_type, mask_buffer);
 
-    io_buffer_check_mask(mask_buffer);
+    io_buffer_check_mask_size(mask_buffer->size);
     io_buffer_check_overlaps(buffer, mask_buffer);
 
     void *base;
@@ -3678,7 +3710,7 @@ io_buffer_xor_inplace(VALUE self, VALUE mask)
     struct rb_io_buffer *mask_buffer = NULL;
     TypedData_Get_Struct(mask, struct rb_io_buffer, &rb_io_buffer_type, mask_buffer);
 
-    io_buffer_check_mask(mask_buffer);
+    io_buffer_check_mask_size(mask_buffer->size);
     io_buffer_check_overlaps(buffer, mask_buffer);
 
     void *base;
@@ -3728,6 +3760,60 @@ io_buffer_not_inplace(VALUE self)
     memory_not_inplace(base, size);
 
     return self;
+}
+
+static size_t
+memory_bit_count(const unsigned char *base, size_t size)
+{
+    size_t count = 0;
+
+    // Process 8 bytes at a time for efficiency:
+    const uint64_t *base64 = (const uint64_t *)base;
+    size_t count64 = size / 8;
+    for (size_t i = 0; i < count64; i += 1) {
+        count += rb_popcount64(base64[i]);
+    }
+
+    // Process any remaining bytes:
+    size_t remaining = size % 8;
+    const unsigned char *tail = base + (count64 * 8);
+    for (size_t i = 0; i < remaining; i += 1) {
+        count += rb_popcount32(tail[i]);
+    }
+
+    return count;
+}
+
+/*
+ *  call-seq: bit_count([offset, [length]]) -> integer
+ *
+ *  Returns the number of set bits (1s) in the buffer, also known as the
+ *  Hamming weight or population count. An optional +offset+ and +length+
+ *  can be provided to count bits in a subrange of the buffer.
+ *
+ *    IO::Buffer.for("\xFF\x00\x0F").bit_count
+ *    # => 12
+ *
+ *    IO::Buffer.for("\xFF\x00\x0F").bit_count(1, 2)
+ *    # => 4
+ */
+static VALUE
+io_buffer_bit_count(int argc, VALUE *argv, VALUE self)
+{
+    rb_check_arity(argc, 0, 2);
+
+    size_t offset, length;
+    struct rb_io_buffer *buffer = io_buffer_extract_offset_length(self, argc, argv, &offset, &length);
+
+    io_buffer_validate_range(buffer, offset, length);
+
+    const void *base;
+    size_t size;
+    io_buffer_get_bytes_for_reading(buffer, &base, &size);
+
+    size_t count = memory_bit_count((const unsigned char *)base + offset, length);
+
+    return SIZET2NUM(count);
 }
 
 /*
@@ -3984,6 +4070,8 @@ Init_IO_Buffer(void)
     rb_define_method(rb_cIOBuffer, "or!", io_buffer_or_inplace, 1);
     rb_define_method(rb_cIOBuffer, "xor!", io_buffer_xor_inplace, 1);
     rb_define_method(rb_cIOBuffer, "not!", io_buffer_not_inplace, 0);
+
+    rb_define_method(rb_cIOBuffer, "bit_count", io_buffer_bit_count, -1);
 
     // IO operations:
     rb_define_method(rb_cIOBuffer, "read", io_buffer_read, -1);

@@ -494,6 +494,14 @@ class TestIOBuffer < Test::Unit::TestCase
     assert_equal string.bytes[3, 5], buffer.each_byte(3, 5).to_a
   end
 
+  def test_each_byte_bounds_error
+    buffer = IO::Buffer.for("A")
+
+    assert_raise(ArgumentError) { buffer.each_byte(0, 2).to_a }
+    assert_raise(ArgumentError) { buffer.each_byte(1, 1).to_a }
+    assert_raise(ArgumentError) { buffer.each_byte(SIZE_MAX, 0).to_a }
+  end
+
   def test_zero_length_each_byte
     buffer = IO::Buffer.new(0)
 
@@ -692,6 +700,59 @@ class TestIOBuffer < Test::Unit::TestCase
     assert_equal IO::Buffer.for("1334133413"), source.dup.or!(mask)
     assert_equal IO::Buffer.for("\x00\x01\x004\x00\x01\x004\x00\x01"), source.dup.xor!(mask)
     assert_equal IO::Buffer.for("\xce\xcd\xcc\xcb\xce\xcd\xcc\xcb\xce\xcd"), source.dup.not!
+  end
+
+  def test_operators_raise_on_freed_self
+    inner = IO::Buffer.new(IO::Buffer::PAGE_SIZE)
+    slice = inner.slice(0, 8)
+    inner.free
+
+    mask = IO::Buffer.for("ABCDEFGH")
+    assert_raise(IO::Buffer::InvalidatedError) { slice & mask }
+    assert_raise(IO::Buffer::InvalidatedError) { slice | mask }
+    assert_raise(IO::Buffer::InvalidatedError) { slice ^ mask }
+    assert_raise(IO::Buffer::InvalidatedError) { ~slice }
+  end
+
+  def test_operators_raise_on_freed_mask
+    inner = IO::Buffer.new(IO::Buffer::PAGE_SIZE)
+    mask_slice = inner.slice(0, 8)
+    inner.free
+
+    source = IO::Buffer.for("ABCDEFGH")
+    assert_raise(IO::Buffer::InvalidatedError) { source & mask_slice }
+    assert_raise(IO::Buffer::InvalidatedError) { source | mask_slice }
+    assert_raise(IO::Buffer::InvalidatedError) { source ^ mask_slice }
+  end
+
+  def test_bit_count
+    # All ones: 8 bits set per byte
+    assert_equal 8,  IO::Buffer.for("\xFF").bit_count
+    # All zeros: no bits set
+    assert_equal 0,  IO::Buffer.for("\x00").bit_count
+    # Mixed: 0xFF (8) + 0x00 (0) + 0x0F (4) = 12
+    assert_equal 12, IO::Buffer.for("\xFF\x00\x0F").bit_count
+    # Subrange: offset=0, length=1 => 0xFF => 8
+    assert_equal 8,  IO::Buffer.for("\xFF\x00\x0F").bit_count(0, 1)
+    # Subrange: offset=1, length=1 => 0x00 => 0
+    assert_equal 0,  IO::Buffer.for("\xFF\x00\x0F").bit_count(1, 1)
+    # Subrange: offset=2, length=1 => 0x0F => 4
+    assert_equal 4,  IO::Buffer.for("\xFF\x00\x0F").bit_count(2, 1)
+    # Subrange: offset=1, length=2 => 0x00 + 0x0F = 4
+    assert_equal 4,  IO::Buffer.for("\xFF\x00\x0F").bit_count(1, 2)
+    # Empty buffer: 0
+    assert_equal 0,  IO::Buffer.new(0).bit_count
+    # 8-byte aligned: 8 bytes of 0xFF => 64 bits
+    assert_equal 64, IO::Buffer.for("\xFF" * 8).bit_count
+    # Cross 8-byte boundary: 9 bytes of 0xFF => 72 bits
+    assert_equal 72, IO::Buffer.for("\xFF" * 9).bit_count
+    # offset=0 with no length => defaults to full buffer:
+    assert_equal 12, IO::Buffer.for("\xFF\x00\x0F").bit_count(0)
+    # offset=1 with no length => 0x00 + 0x0F = 4:
+    assert_equal 4,  IO::Buffer.for("\xFF\x00\x0F").bit_count(1)
+    # Out-of-range raises
+    assert_raise(ArgumentError) { IO::Buffer.for("\xFF").bit_count(0, 2) }
+    assert_raise(ArgumentError) { IO::Buffer.for("\xFF").bit_count(1, 1) }
   end
 
   def test_shared
